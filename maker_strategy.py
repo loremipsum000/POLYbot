@@ -140,6 +140,14 @@ class MakerStrategy:
                         symbol = "BTCUSDT" if label == "BTC" else "ETHUSDT"
                         strike = get_open_price_at_ts(symbol, start_ts)
 
+                    # Fallback: if we started late and could not fetch the window open,
+                    # seed strike with the current Binance price so we can still quote.
+                    if strike is None and self.binance_feed:
+                        live_price = self.binance_feed.get_price(label)
+                        if live_price:
+                            strike = live_price
+                            print(f"[Maker] ⚠️ {label}: Missing strike; falling back to live price {strike:.2f}")
+
                     self.markets[label] = MarketData(
                         slug=m.get('market_slug'),
                         condition_id=c_id,
@@ -156,13 +164,22 @@ class MakerStrategy:
                 print(f"[Maker] ❌ Error fetching details for {label}: {e}")
 
     async def cancel_all_orders(self, token_ids: List[str]):
-        """Cancel open orders for provided token_ids."""
-        if not token_ids:
+        """Cancel open orders for provided token_ids by tracked order IDs."""
+        if not token_ids or not self.clob_client:
             return
+
+        order_ids: List[str] = []
+        for tid in token_ids:
+            order_ids.extend(self.open_orders.get(tid, []))
+            self.open_orders.pop(tid, None)
+
+        if not order_ids:
+            return
+
         try:
-            for tid in token_ids:
-                self.clob_client.cancel_orders(token_id=tid)
-                self.open_orders.pop(tid, None)
+            for oid in order_ids:
+                # Cancel individually to match client signature
+                self.clob_client.cancel_order(order_id=oid)
         except Exception as e:
             print(f"[Maker] ⚠️ Error cancelling orders: {e}")
 
@@ -213,11 +230,15 @@ class MakerStrategy:
         if not ref_price:
             return 0.0, 0.0
 
-        # Require strike; if missing, do not quote.
-        if not market.strike_price:
+        # Require strike; if missing, fall back to live price to keep the bot quoting in tests.
+        strike = market.strike_price
+        if not strike and ref_price:
+            strike = ref_price
+            market.strike_price = strike
+            print(f"[Maker] ⚠️ {asset_label}: Strike missing; using live price {strike:.2f} as fallback")
+        if not strike:
             return 0.0, 0.0
 
-        strike = market.strike_price
         t_years = get_time_to_expiry(market.end_date_iso)
         # Compute fair probability from external price
         fair_prob = calculate_fair_probability(ref_price, strike, t_years, volatility=MAKER_VOL)
@@ -298,18 +319,13 @@ class MakerStrategy:
                     fair = f"{target_yes+target_no:.2f}"
                 print(f"[Maker] 💸 {label}: Bids YES@{target_yes:.2f}, NO@{target_no:.2f} (Sum: {fair})")
                 try:
-                    # Batch create and post
-                    created = [self.clob_client.create_order(o) for o in orders_to_place]
-                    resp = self.clob_client.post_orders(created, OrderType.GTC)
-                    # Record quotes/order ids if returned
-                    if isinstance(resp, list):
-                        for r, o in zip(resp, orders_to_place):
-                            oid = r.get('orderID') or r.get('id')
-                            self._record_quote(o.token_id, o.price, oid)
-                    else:
-                        # fallback if single response
-                        for o in orders_to_place:
-                            self._record_quote(o.token_id, o.price)
+                    for o in orders_to_place:
+                        order = self.clob_client.create_order(o)
+                        resp = self.clob_client.post_order(order, OrderType.GTC)
+                        oid = None
+                        if isinstance(resp, dict):
+                            oid = resp.get('orderID') or resp.get('id')
+                        self._record_quote(o.token_id, o.price, oid)
                 except Exception as e:
                     print(f"[Maker] ⚠️ Order placement failed: {e}")
             else:
