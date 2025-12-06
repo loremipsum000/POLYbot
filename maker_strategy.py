@@ -148,6 +148,14 @@ class MakerStrategy:
                             strike = live_price
                             print(f"[Maker] ⚠️ {label}: Missing strike; falling back to live price {strike:.2f}")
 
+                    # Quick sanity check: ensure orderbooks exist before trading
+                    try:
+                        self.clob_client.get_order_book(yes_id)
+                        self.clob_client.get_order_book(no_id)
+                    except Exception:
+                        print(f"[Maker] ⚠️ {label}: Skipping - token orderbook not available (404)")
+                        continue
+
                     self.markets[label] = MarketData(
                         slug=m.get('market_slug'),
                         condition_id=c_id,
