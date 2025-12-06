@@ -61,9 +61,10 @@ class BundleConfig:
     
     # Entry Price Thresholds (WIDENED based on actual price ranges)
     # Gabagool22 buys Up $0.09-$0.91, Down $0.11-$0.89
-    max_yes_price: float = 0.92         # He pays up to ~0.91 on strong side
-    max_no_price: float = 0.30          # Require cheap hedge leg
-    cheap_side_threshold: float = 0.30  # Require at least one side at/under this
+    # Allow paying up to near-fair on either side; rely on bundle cap to stay neutral
+    max_yes_price: float = 0.99
+    max_no_price: float = 0.99
+    cheap_side_threshold: float = 1.00  # effectively disabled; bundle cap governs entry
     
     # Execution (avg 16.8 fills per transaction - AGGRESSIVE multi-fill)
     order_size: float = 16              # Confirmed 16 shares standard
@@ -355,12 +356,7 @@ class BundleCostCalculator:
         if not self.current.has_liquidity:
             return False, "No liquidity"
         
-        # Require at least one cheap side to mirror gabagool2's pattern
-        cheap_side = min(self.current.best_ask_yes, self.current.best_ask_no)
-        if cheap_side > self.config.cheap_side_threshold:
-            return False, f"Cheapest side ${cheap_side:.3f} > cheap threshold ${self.config.cheap_side_threshold}"
-        
-        # Check individual price thresholds
+        # Check individual price thresholds (kept as sanity bounds)
         if self.current.best_ask_yes > self.config.max_yes_price:
             return False, f"YES ask ${self.current.best_ask_yes:.3f} > max ${self.config.max_yes_price}"
         
@@ -600,15 +596,15 @@ class DualSideSweeper:
         
         Returns (yes_fills, no_fills, yes_volume, no_volume)
         """
-        # Price checks
+        # Require both sides present and bundle within threshold
+        if book.best_ask_yes <= 0 or book.best_ask_no <= 0:
+            return 0, 0, 0.0, 0.0
+        bundle_cost = book.best_ask_yes + book.best_ask_no
+        if bundle_cost >= self.config.max_bundle_cost:
+            return 0, 0, 0.0, 0.0
         yes_price = min(book.best_ask_yes, self.config.max_yes_price)
         no_price = min(book.best_ask_no, self.config.max_no_price)
-        
-        # Skip if prices too expensive
-        place_yes = yes_price <= self.config.max_yes_price
-        place_no = no_price <= self.config.max_no_price
-        
-        if not place_yes and not place_no:
+        if yes_price > self.config.max_yes_price or no_price > self.config.max_no_price:
             return 0, 0, 0.0, 0.0
         
         # Multi-fill execution: target ~17 fills per sweep
@@ -624,11 +620,9 @@ class DualSideSweeper:
             position, book, size_per_order
         )
         
-        # Build alternating order list (YES, NO, YES, NO, ...)
-        # This mimics gabagool22's balanced execution
+        # Build paired order list to reduce leg risk (YES+NO together)
         orders_to_place = []
         
-        # Alternate between YES and NO, respecting balance
         yes_count = 0
         no_count = 0
         max_per_side = target_fills // 2 + 1
@@ -638,36 +632,26 @@ class DualSideSweeper:
         no_limit = max_per_side if no_top_liquidity == float("inf") else int(no_top_liquidity // base_no)
         yes_limit = max(0, min(max_per_side, yes_limit))
         no_limit = max(0, min(max_per_side, no_limit))
+        pair_limit = min(target_fills // 2, yes_limit, no_limit)
+        if pair_limit <= 0:
+            return 0, 0, 0.0, 0.0
         
-        for i in range(target_fills):
-            # Decide which side based on balance
-            if position.yes_shares > position.no_shares * 1.1:
-                # Favor NO to catch up
-                if place_no and no_count < no_limit:
-                    orders_to_place.append(('NO', no_price, base_no))
-                    no_count += 1
-                elif place_yes and yes_count < yes_limit:
+        start_side = 'NO' if position.yes_shares > position.no_shares else 'YES'
+        for i in range(pair_limit):
+            if start_side == 'YES':
+                if yes_count < yes_limit:
                     orders_to_place.append(('YES', yes_price, base_yes))
                     yes_count += 1
-            elif position.no_shares > position.yes_shares * 1.1:
-                # Favor YES to catch up
-                if place_yes and yes_count < yes_limit:
-                    orders_to_place.append(('YES', yes_price, base_yes))
-                    yes_count += 1
-                elif place_no and no_count < no_limit:
+                if no_count < no_limit:
                     orders_to_place.append(('NO', no_price, base_no))
                     no_count += 1
             else:
-                # Balanced - alternate
-                if i % 2 == 0 and place_yes and yes_count < yes_limit:
-                    orders_to_place.append(('YES', yes_price, base_yes))
-                    yes_count += 1
-                elif place_no and no_count < no_limit:
+                if no_count < no_limit:
                     orders_to_place.append(('NO', no_price, base_no))
                     no_count += 1
-        
-        if not orders_to_place:
-            return 0, 0, 0.0, 0.0
+                if yes_count < yes_limit:
+                    orders_to_place.append(('YES', yes_price, base_yes))
+                    yes_count += 1
         
         # Execute all orders concurrently for speed
         async def _execute_order(side, price, size):
